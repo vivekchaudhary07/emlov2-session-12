@@ -1,0 +1,4 @@
+[core]
+    remote = storage
+['remote "storage"']
+    url = s3://sagemaker-ap-south-1-006547668672/sagemaker-flower-dvc
