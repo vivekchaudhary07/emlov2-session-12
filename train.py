@@ -26,23 +26,25 @@ ml_root = Path("/opt/ml")
 
 git_path = ml_root / "sagemaker-flower"
 
-dvc_repo_url = os.environ.get('DVC_REPO_URL')
-dvc_branch = os.environ.get('DVC_BRANCH')
-
+dvc_repo_url = os.environ.get("DVC_REPO_URL")
+dvc_branch = os.environ.get("DVC_BRANCH")
 
 
 def get_training_env():
     sm_training_env = os.environ.get("SM_TRAINING_ENV")
     sm_training_env = json.loads(sm_training_env)
-    
+
     return sm_training_env
+
 
 class LitResnet(pl.LightningModule):
     def __init__(self, num_classes=10, lr=0.05):
         super().__init__()
 
         self.save_hyperparameters()
-        self.model = timm.create_model('resnet18', pretrained=True, num_classes=num_classes)
+        self.model = timm.create_model(
+            "resnet18", pretrained=True, num_classes=num_classes
+        )
 
     def forward(self, x):
         out = self.model(x)
@@ -81,6 +83,7 @@ class LitResnet(pl.LightningModule):
         )
         return {"optimizer": optimizer}
 
+
 class FlowerDataModule(pl.LightningDataModule):
     def __init__(
         self,
@@ -94,15 +97,17 @@ class FlowerDataModule(pl.LightningDataModule):
         # this line allows to access init params with 'self.hparams' attribute
         # also ensures init params will be stored in ckpt
         self.save_hyperparameters(logger=False)
-        
+
         self.data_dir = Path(data_dir)
 
         # data transformations
-        self.transforms = T.Compose([
-            T.ToTensor(),
-            T.Resize((224, 224)),
-            T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-        ])
+        self.transforms = T.Compose(
+            [
+                T.ToTensor(),
+                T.Resize((224, 224)),
+                T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+            ]
+        )
 
         self.data_train: Optional[Dataset] = None
         self.data_test: Optional[Dataset] = None
@@ -110,7 +115,7 @@ class FlowerDataModule(pl.LightningDataModule):
     @property
     def num_classes(self):
         return len(self.data_train.classes)
-    
+
     @property
     def classes(self):
         return self.data_train.classes
@@ -130,7 +135,7 @@ class FlowerDataModule(pl.LightningDataModule):
         if not self.data_train and not self.data_test:
             trainset = ImageFolder(self.data_dir / "train", transform=self.transforms)
             testset = ImageFolder(self.data_dir / "test", transform=self.transforms)
-            
+
             self.data_train, self.data_test = trainset, testset
 
     def train_dataloader(self):
@@ -173,57 +178,58 @@ class FlowerDataModule(pl.LightningDataModule):
         pass
 
 
-
 def train(model, datamodule, sm_training_env):
-    tb_logger = pl_loggers.TensorBoardLogger(save_dir=ml_root / "output" / "tensorboard" / sm_training_env["job_name"])
-    
-    trainer = pl.Trainer(
-        max_epochs=2,
-        accelerator="auto",
-        logger=[tb_logger]
+    tb_logger = pl_loggers.TensorBoardLogger(
+        save_dir=ml_root / "output" / "tensorboard" / sm_training_env["job_name"]
     )
-    
+
+    trainer = pl.Trainer(max_epochs=2, accelerator="auto", logger=[tb_logger])
+
     trainer.fit(model, datamodule)
+
 
 def save_scripted_model(model, output_dir):
     script = model.to_torchscript()
 
     # save for use in production environment
     torch.jit.save(script, output_dir / "model.scripted.pt")
-    
-    
+
+
 def clone_dvc_git_repo():
     print(f":: Configure git to pull authenticated from CodeCommit")
     print(f":: Cloning repo: {dvc_repo_url}, git branch: {dvc_branch}")
-    subprocess.check_call(["git", "clone", "--depth", "1", "--branch", dvc_branch, dvc_repo_url, git_path])
-    
+    subprocess.check_call(
+        ["git", "clone", "--depth", "1", "--branch", dvc_branch, dvc_repo_url, git_path]
+    )
+
 
 def dvc_pull():
     print(":: Running dvc pull command")
     os.chdir(git_path)
-    
+
     print(f":: Pull from DVC")
     subprocess.check_call(["dvc", "pull"])
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     clone_dvc_git_repo()
     dvc_pull()
-    
+
     img_dset = ImageFolder(git_path / "dataset" / "train")
-    
+
     print(":: Classnames: ", img_dset.classes)
-    
-    datamodule = FlowerDataModule(data_dir=(git_path / "dataset").absolute(), num_workers=num_cpus)
+
+    datamodule = FlowerDataModule(
+        data_dir=(git_path / "dataset").absolute(), num_workers=num_cpus
+    )
     datamodule.setup()
-    
+
     model = LitResnet(num_classes=datamodule.num_classes)
-    
+
     sm_training_env = get_training_env()
-    
+
     print(":: Training ...")
     train(model, datamodule, sm_training_env)
-    
+
     print(":: Saving Scripted Model")
     save_scripted_model(model, sm_model_dir)
-   
