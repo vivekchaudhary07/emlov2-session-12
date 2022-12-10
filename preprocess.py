@@ -1,17 +1,17 @@
-import os
 import argparse
-import sys
-import subprocess
 import glob
+import os
 import shutil
-import dvc.api
-
+import subprocess
+import sys
 from collections import Counter
+from pathlib import Path
+
+import dvc.api
 from git.repo.base import Repo
+from sklearn.model_selection import train_test_split
 from smexperiments.tracker import Tracker
 from torchvision.datasets.utils import extract_archive
-from sklearn.model_selection import train_test_split
-from pathlib import Path
 
 
 dvc_repo_url = os.environ.get("DVC_REPO_URL")
@@ -77,21 +77,29 @@ def write_dataset(image_paths, output_dir):
 
 
 def generate_dataset():
-    dataset_extracted = ml_root / 'intel-image-classification'
+    dataset_extracted = ml_root / "intel-image-classification"
     dataset_extracted.mkdir(parents=True, exist_ok=True)
 
     # split dataset and save to their directories
     print(f":: Extracting Zip {dataset_zip} to {dataset_extracted}")
     extract_archive(from_path=dataset_zip, to_path=dataset_extracted)
 
-    d_train = list((dataset_extracted / 'seg_train' / 'seg_train').glob('*/*'))
-    d_test = list((dataset_extracted / 'seg_test' / 'seg_test').glob('*/*'))
-    d_val = list((dataset_extracted / 'seg_pred' / 'seg_pred').glob('*/'))
+    ds = list((dataset_extracted / "seg_train" / "seg_train").glob("*/*"))
+    ds += list((dataset_extracted / "seg_test" / "seg_test").glob("*/*"))
+    d_pred = list((dataset_extracted / "seg_pred" / "seg_pred").glob("*/"))
+
+    labels = [x.parent.stem for x in ds]
+    print(":: Dataset Class Counts: ", Counter(labels))
+
+    d_train, d_test = train_test_split(ds, test_size=0.3, stratify=labels)
+    d_test, d_val = train_test_split(
+        d_test, test_size=0.5, stratify=[x.parent.stem for x in d_test]
+    )
 
     print("\t:: Train Dataset Class Counts: ", Counter(x.parent.stem for x in d_train))
     print("\t:: Test Dataset Class Counts: ", Counter(x.parent.stem for x in d_test))
-    print("\t:: Total validation images", len(d_val))
-
+    print("\t:: Val Dataset Class Counts: ", Counter(x.parent.stem for x in d_val))
+    print("\t:: Total validation images", len(d_pred))
 
     for path in ["train", "test", "val"]:
         output_dir = git_path / "dataset" / path
@@ -102,6 +110,7 @@ def generate_dataset():
     write_dataset(d_train, git_path / "dataset" / "train")
     write_dataset(d_test, git_path / "dataset" / "test")
     write_dataset(d_val, git_path / "dataset" / "val")
+    write_dataset(d_pred, git_path / "dataset" / "pred")
 
 
 if __name__ == "__main__":
@@ -120,3 +129,4 @@ if __name__ == "__main__":
 
     print(":: Sync Processed Data to Git & DVC")
     sync_data_with_dvc(repo)
+    print(":: Finished..")
