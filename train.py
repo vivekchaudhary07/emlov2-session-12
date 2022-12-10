@@ -1,22 +1,23 @@
-from typing import Any, Dict, Optional, Tuple
-
+import json
 import os
 import subprocess
-import torch
-import timm
-import json
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Dict, Optional, Tuple
 
 import pytorch_lightning as pl
-import torchvision.transforms as T
+import timm
+import torch
 import torch.nn.functional as F
+import torchvision.transforms as T
 
-from pathlib import Path
-from torchvision.datasets import ImageFolder
+from pytorch_lightning import loggers as pl_loggers
+from pytorch_lightning.callbacks import TQDMProgressBar
 from pytorch_lightning.plugins.environments import LightningEnvironment
 from torch.utils.data import DataLoader, Dataset
-from torchmetrics.functional import accuracy
-from pytorch_lightning import loggers as pl_loggers
-from datetime import datetime
+from torchmetrics import Accuracy
+from torchvision.datasets import ImageFolder
+
 
 sm_output_dir = Path(os.environ.get("SM_OUTPUT_DIR"))
 sm_model_dir = Path(os.environ.get("SM_MODEL_DIR"))
@@ -24,10 +25,13 @@ num_cpus = int(os.environ.get("SM_NUM_CPUS"))
 
 ml_root = Path("/opt/ml")
 
-git_path = ml_root / "sagemaker-flower"
+git_path = ml_root / "sagemaker-intel_image"
 
 dvc_repo_url = os.environ.get("DVC_REPO_URL")
 dvc_branch = os.environ.get("DVC_BRANCH")
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+accuracy = Accuracy(task="multiclass", num_classes=6)
 
 
 def get_training_env():
@@ -50,13 +54,6 @@ class LitResnet(pl.LightningModule):
         out = self.model(x)
         return F.log_softmax(out, dim=1)
 
-    def training_step(self, batch, batch_idx):
-        x, y = batch
-        logits = self(x)
-        loss = F.nll_loss(logits, y)
-        self.log("train_loss", loss)
-        return loss
-
     def evaluate(self, batch, stage=None):
         x, y = batch
         logits = self(x)
@@ -67,6 +64,17 @@ class LitResnet(pl.LightningModule):
         if stage:
             self.log(f"{stage}/loss", loss, prog_bar=True)
             self.log(f"{stage}/acc", acc, prog_bar=True)
+
+    def training_step(self, batch, batch_idx):
+        x, y = batch
+        logits = self(x)
+        loss = F.nll_loss(logits, y)
+        preds = torch.argmax(logits, dim=1)
+        acc = accuracy(preds, y)
+
+        self.log(f"train/loss", loss, prog_bar=True)
+        self.log(f"train/acc", acc, prog_bar=True)
+        return loss
 
     def validation_step(self, batch, batch_idx):
         self.evaluate(batch, "val")
@@ -84,7 +92,7 @@ class LitResnet(pl.LightningModule):
         return {"optimizer": optimizer}
 
 
-class FlowerDataModule(pl.LightningDataModule):
+class IntelImgClfDataModule(pl.LightningDataModule):
     def __init__(
         self,
         data_dir: str = "data/",
@@ -135,8 +143,9 @@ class FlowerDataModule(pl.LightningDataModule):
         if not self.data_train and not self.data_test:
             trainset = ImageFolder(self.data_dir / "train", transform=self.transforms)
             testset = ImageFolder(self.data_dir / "test", transform=self.transforms)
+            valset = ImageFolder(self.data_dir / "val", transform=self.transforms)
 
-            self.data_train, self.data_test = trainset, testset
+            self.data_train, self.data_test, self.data_val = trainset, testset, valset
 
     def train_dataloader(self):
         return DataLoader(
@@ -149,7 +158,7 @@ class FlowerDataModule(pl.LightningDataModule):
 
     def val_dataloader(self):
         return DataLoader(
-            dataset=self.data_train,
+            dataset=self.data_val,
             batch_size=self.hparams.batch_size,
             num_workers=self.hparams.num_workers,
             pin_memory=self.hparams.pin_memory,
@@ -178,14 +187,42 @@ class FlowerDataModule(pl.LightningDataModule):
         pass
 
 
-def train(model, datamodule, sm_training_env):
+def train_and_evaluate(model, datamodule, sm_training_env, output_dir):
     tb_logger = pl_loggers.TensorBoardLogger(
         save_dir=ml_root / "output" / "tensorboard" / sm_training_env["job_name"]
     )
-
-    trainer = pl.Trainer(max_epochs=2, accelerator="auto", logger=[tb_logger])
+    trainer = pl.Trainer(
+        max_epochs=5,
+        accelerator="auto",
+        logger=[tb_logger],
+        callbacks=[TQDMProgressBar(refresh_rate=10)],
+    )
 
     trainer.fit(model, datamodule)
+    trainer.test(model, datamodule)
+
+    idx_to_class = {k: v for v, k in datamodule.data_train.class_to_idx.items()}
+    model.idx_to_class = idx_to_class
+
+    # per class accuracy
+    confusion_matrix = torch.zeros(datamodule.num_classes, datamodule.num_classes)
+    with torch.no_grad():
+        for i, (images, targets) in enumerate(datamodule.test_dataloader()):
+            images = images.to(device)
+            targets = targets.to(device)
+            outputs = model(images)
+            _, preds = torch.max(outputs, 1)
+            for t, p in zip(targets.view(-1), preds.view(-1)):
+                confusion_matrix[t.long(), p.long()] += 1
+
+    acc_per_class = {
+        idx_to_class[idx]: val.item() * 100
+        for idx, val in enumerate(confusion_matrix.diag() / confusion_matrix.sum(1))
+    }
+    print(acc_per_class)
+
+    with open(output_dir / "accuracy_per_class.json", "w") as outfile:
+        json.dump(acc_per_class, outfile)
 
 
 def save_scripted_model(model, output_dir):
@@ -219,17 +256,18 @@ if __name__ == "__main__":
 
     print(":: Classnames: ", img_dset.classes)
 
-    datamodule = FlowerDataModule(
+    datamodule = IntelImgClfDataModule(
         data_dir=(git_path / "dataset").absolute(), num_workers=num_cpus
     )
     datamodule.setup()
 
     model = LitResnet(num_classes=datamodule.num_classes)
+    model = model.to(device)
 
     sm_training_env = get_training_env()
 
     print(":: Training ...")
-    train(model, datamodule, sm_training_env)
+    train_and_evaluate(model, datamodule, sm_training_env, sm_model_dir)
 
     print(":: Saving Scripted Model")
     save_scripted_model(model, sm_model_dir)
